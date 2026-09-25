@@ -246,6 +246,7 @@ def apply_patch_7_gemma4_mm_guard():
     _gemma4_mm_file = pathlib.Path(_gemma4_mm_spec.origin)
     _code = _gemma4_mm_file.read_text()
 
+    # 1. Guard get_mm_max_tokens_per_item
     _old = "        tokens_per_image = config.vision_config.default_output_length"
     _new = (
         "        if config.vision_config is None:\n"
@@ -255,15 +256,160 @@ def apply_patch_7_gemma4_mm_guard():
 
     if _old in _code:
         _code = _code.replace(_old, _new)
-        _gemma4_mm_file.write_text(_code)
-        print("[Patch 7] Applied Gemma4 vision_config=None guard")
-    elif "if config.vision_config is None:" in _code:
-        print("[Patch 7] Already present")
-    else:
-        print("[Patch 7] Target pattern not found in gemma4_mm.py")
+        print("[Patch 7-1] Applied Gemma4 tokens_per_image guard")
 
-    assert "if config.vision_config is None:" in _gemma4_mm_file.read_text(), "Patch 7 verification failed!"
+    # 2. Guard vision_tower initialization in __init__
+    _old_vt = """        else:
+            vision_cfg = config.vision_config
+            quantizable = (
+                vision_cfg.hidden_size % 64 == 0
+                and vision_cfg.intermediate_size % 64 == 0
+            )
+            tower_quant = quant_config if quantizable else None
+
+        # ---- Vision tower (shared by image and video) ----
+        with self._mark_tower_model(vllm_config, {"image", "video"}):
+            self.vision_tower = AutoModel.from_config(config=config.vision_config)
+            self.embed_vision = Gemma4MultimodalEmbedder(
+                config.vision_config,
+                config.text_config,
+                quant_config=tower_quant,
+                prefix=maybe_prefix(prefix, "embed_vision"),
+            )
+            recursive_replace_linear(
+                self.vision_tower,
+                tower_quant,
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )"""
+
+    _new_vt = """        elif config.vision_config is not None:
+            vision_cfg = config.vision_config
+            quantizable = (
+                vision_cfg.hidden_size % 64 == 0
+                and vision_cfg.intermediate_size % 64 == 0
+            )
+            tower_quant = quant_config if quantizable else None
+        else:
+            tower_quant = None
+
+        # ---- Vision tower (shared by image and video) ----
+        if config.vision_config is not None:
+            with self._mark_tower_model(vllm_config, {"image", "video"}):
+                self.vision_tower = AutoModel.from_config(config=config.vision_config)
+                self.embed_vision = Gemma4MultimodalEmbedder(
+                    config.vision_config,
+                    config.text_config,
+                    quant_config=tower_quant,
+                    prefix=maybe_prefix(prefix, "embed_vision"),
+                )
+                recursive_replace_linear(
+                    self.vision_tower,
+                    tower_quant,
+                    prefix=maybe_prefix(prefix, "vision_tower"),
+                )
+        else:
+            self.vision_tower = None
+            self.embed_vision = None"""
+
+    if _old_vt in _code:
+        _code = _code.replace(_old_vt, _new_vt)
+        print("[Patch 7-2] Applied Gemma4 vision_tower guard")
+
+    _gemma4_mm_file.write_text(_code)
+
+    assert "if config.vision_config is None:" in _code, "Patch 7-1 verification failed!"
+    assert "self.vision_tower = None" in _code, "Patch 7-2 verification failed!"
     print("[Patch 7] Verified successfully")
+
+
+def apply_patch_8_gemma4_tensor_name_map():
+    """Patch 8: Strip 'model.language_model.' prefix and map router scales for Gemma4 in default weights adapter."""
+    import vllm_gguf_plugin.weights_adapter.default as d
+    d_file = inspect.getfile(d)
+    with open(d_file, "r") as f:
+        d_code = f.read()
+
+    # 1. Strip 'model.language_model.' prefix
+    old_snippet = """        def find_hf_name_in_tensor_map(hf_name: str) -> str | None:
+            if is_multimodal and hf_name.startswith("model."):"""
+
+    new_snippet = """        def find_hf_name_in_tensor_map(hf_name: str) -> str | None:
+            if hf_name.startswith("model.language_model."):
+                hf_name = "model." + hf_name[len("model.language_model."):]
+            if is_multimodal and hf_name.startswith("model."):"""
+
+    if old_snippet in d_code:
+        d_code = d_code.replace(old_snippet, new_snippet)
+        print("[Patch 8-1] Patched find_hf_name_in_tensor_map for Gemma4 model.language_model prefix")
+
+    # 2. Add gemma4 router scales and sideload_params
+    target_pos = 'if model_type == "minimax_m2":'
+    gemma4_block = '''if model_type in ("gemma4", "gemma-4"):
+            for idx in range(config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_inp.scale"] = (
+                    f"model.language_model.layers.{idx}.router.scale"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.scale"] = (
+                    f"model.language_model.layers.{idx}.router.per_expert_scale"
+                )
+                sideload_params.extend([
+                    regex.compile(f"model\\\\.language_model\\\\.layers\\\\.{idx}\\\\.router\\\\.(scale|per_expert_scale)"),
+                    regex.compile(f"model\\\\.layers\\\\.{idx}\\\\.router\\\\.(scale|per_expert_scale)"),
+                ])
+        if model_type == "minimax_m2":'''
+
+    if target_pos in d_code and 'model_type in ("gemma4", "gemma-4"):' not in d_code:
+        d_code = d_code.replace(target_pos, gemma4_block)
+        print("[Patch 8-2] Added Gemma4 router.scale mapping and sideload_params")
+
+    with open(d_file, "w") as f:
+        f.write(d_code)
+
+    assert 'if hf_name.startswith("model.language_model."):' in open(d_file).read(), "Patch 8-1 verification failed"
+    assert 'model_type in ("gemma4", "gemma-4"):' in open(d_file).read(), "Patch 8-2 verification failed"
+    print("[Patch 8] Verified successfully")
+
+
+def apply_patch_9_gemma4_heterogeneous_head_dim():
+    """Patch 9: Support per-layer heterogeneous head_dim for Gemma4 full attention layers."""
+    _gemma4_spec = importlib.util.find_spec("vllm.model_executor.models.gemma4")
+    if not _gemma4_spec or not _gemma4_spec.origin:
+        print("[Patch 9] gemma4 module not found, skipping")
+        return
+
+    _gemma4_file = pathlib.Path(_gemma4_spec.origin)
+    _code = _gemma4_file.read_text()
+
+    old_snippet = """        # Gemma4 uses different head dimensions for sliding vs full attention
+        layer_type = config.layer_types[layer_idx]
+        self.is_full_attention = layer_type == "full_attention"
+        if self.is_full_attention:
+            head_dim = getattr(config, "global_head_dim", config.head_dim)
+        else:
+            head_dim = config.head_dim"""
+
+    new_snippet = """        # Gemma4 uses different head dimensions for sliding vs full attention
+        layer_type = config.layer_types[layer_idx]
+        self.is_full_attention = layer_type == "full_attention"
+        if hasattr(config, "per_layer_config") and layer_idx < len(config.per_layer_config):
+            head_dim = config.per_layer_config[layer_idx].head_dim
+        elif self.is_full_attention:
+            head_dim = getattr(config, "global_head_dim", None) or 512
+        else:
+            head_dim = getattr(config, "head_dim", 256)"""
+
+    if old_snippet in _code:
+        _code = _code.replace(old_snippet, new_snippet)
+        _gemma4_file.write_text(_code)
+        print("[Patch 9] Applied Gemma4 heterogeneous head_dim resolution")
+    elif 'hasattr(config, "per_layer_config")' in _code:
+        print("[Patch 9] Already present")
+    else:
+        raise RuntimeError("Patch 9 target pattern not found in gemma4.py")
+
+    assert 'hasattr(config, "per_layer_config")' in _gemma4_file.read_text(), "Patch 9 verification failed"
+    print("[Patch 9] Verified successfully")
+
 
 def main():
     print_environment_info()
@@ -275,6 +421,8 @@ def main():
         ("Patch 5: vLLM mamba_mixer2 loader", apply_patch_5_mamba_mixer2),
         ("Patch 6: vllm_gguf_plugin fused_mul_mat auto-correction", apply_patch_6_linear_quant),
         ("Patch 7: Gemma4 text-only GGUF guard", apply_patch_7_gemma4_mm_guard),
+        ("Patch 8: Gemma4 model.language_model prefix strip", apply_patch_8_gemma4_tensor_name_map),
+        ("Patch 9: Gemma4 heterogeneous head_dim resolution", apply_patch_9_gemma4_heterogeneous_head_dim),
     ]
 
     for name, patch_fn in patches:
@@ -284,7 +432,8 @@ def main():
             print(f"❌ ERROR applying {name}: {e}", file=sys.stderr)
             sys.exit(1)
 
-    print("\n✅ All 7 ROCm vLLM patches applied and verified successfully!\n")
+    print("\n✅ All 9 ROCm vLLM patches applied and verified successfully!\n")
 
 if __name__ == "__main__":
     main()
+
