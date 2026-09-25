@@ -8,12 +8,14 @@ docker rm -f vllm-server 2>/dev/null || true
 
 echo "=== Starting vLLM: Gemma 4 26B on Port 8001 (TP=2) ==="
 
+RENDER_GID=$(getent group render 2>/dev/null | cut -d: -f3 || echo 992)
+
 docker run -d \
   --name vllm-server \
   --device=/dev/kfd \
   --device=/dev/dri \
   --group-add video \
-  --group-add render \
+  --group-add "$RENDER_GID" \
   --network=host \
   --ipc=host \
   -v /home/k-takeda/gAI-LLM/models:/models:ro \
