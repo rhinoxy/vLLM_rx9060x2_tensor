@@ -8,10 +8,10 @@ AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / Navi）環境にお�
 
 - **ビルド時パッチ統合（Production-grade）**:
   - 従来コンテナ起動時に行っていた `site-packages` の直接書き換えを廃止。
-  - `vllm_rocm/Dockerfile` のビルド時に全7パッチを自動適用＆厳格にアサート検証し、`rocm-vllm:custom-gfx1200` イメージとして固定化。
+  - `vllm_rocm/Dockerfile` のビルド時に全9パッチを自動適用＆厳格にアサート検証し、`rocm-vllm:custom-gfx1200` イメージとして固定化。
 - **最小権限セキュリティ（No `--privileged`）**:
   - ホスト権限を丸ごと与える `--privileged` や不要な `sudo` グループを撤廃。
-  - `--device=/dev/kfd --device=/dev/dri --group-add video --group-add render` の最小限のデバイスアクセスで動作。
+  - `--device=/dev/kfd --device=/dev/dri --group-add video --group-add "$RENDER_GID"` の最小限のデバイスアクセスで動作（ホストの `render` グループ GID をスクリプト側で自動解決）。
 - **Navi (gfx1200) 最適化設定**:
   - **`--ipc=host` 維持**: TP=2 でのマルチGPU間 PyTorch 共有メモリ（Shared Memory）通信の枯渇・ハングを防止。
   - **`--enforce-eager` 維持**: gfx1200 において不安定な HIP Graph キャプチャを回避し、Triton カスタムカーネルを安定稼働。
@@ -30,7 +30,19 @@ AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / Navi）環境にお�
 | **Patch 4** | `vllm.model_executor.models.qwen3_5` | `VocabParallelEmbedding` への `quant_config` とプレフィックス伝播 |
 | **Patch 5** | `vllm.model_executor.layers.mamba.mamba_mixer2` | 重みテンソルの形状不一致時における自動 `view_as` 適合 |
 | **Patch 6** | `vllm_gguf_plugin.quantization.linear` | `qweight_type` の自動判定・補正、ブロック非整合時の Triton DEQUANT 安全フォールバック |
-| **Patch 7** | `vllm.model_executor.models.gemma4_mm` | Gemma 4 テキスト専用 GGUF における `vision_config=None` 例外ガード |
+| **Patch 7** | `vllm.model_executor.models.gemma4_mm` | Gemma 4 テキスト専用 GGUF における `vision_config=None` ガード（`get_mm_max_tokens_per_item` および `vision_tower` 初期化） |
+| **Patch 8** | `vllm_gguf_plugin.weights_adapter.default` | Gemma 4 重み読み込み時の `model.language_model.` プレフィックス除去および `router.scale` / `router.per_expert_scale` のマッピング |
+| **Patch 9** | `vllm.model_executor.models.gemma4` | Gemma 4 の不均一 `head_dim` (sliding: 256 / full: 512) を `per_layer_config` から適切に取得・設定 |
+
+---
+
+## 📊 モデル稼働状況 & 既知の課題
+
+- **Gemma 4 (26B-A4W4 / GGUF Q4_K_M)**:
+  - **ロード完了**: 重みロード（約102秒）およびレイヤー構築は Patch 7〜9 により正常パス。
+  - **現在対応中**: 推論プロファイリング時の MoE パラメータ初期化 (`fused_moe_gguf` における `w13_qweight` / `w2_qweight` のマテリアライズとマッピング) の解決作業中。
+- **Qwen 3.8 (27B GGUF)**:
+  - SSM (State Space Model) / GDN Triton カーネル (`fused_recurrent_gated_delta_rule_packed_decode_kernel`) の gfx1200 互換性（NaN出力）の課題を調査中。
 
 ---
 
