@@ -1,53 +1,78 @@
-# Dual RX 9060 XT vLLM ROCm Setup (gAI-LLM)
+# Dual RX 9060 XT vLLM ROCm Setup (`vLLM_rx9060x2_tensor`)
 
-AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200`）環境において、ROCm版 vLLM を用いて大規模言語モデル（Qwen 3.8 27B, Gemma 4 26B 等）を Tensor Parallelism (TP=2) で高速推論するためのセットアップおよびパッチ集です。
+AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / Navi）環境において、ROCm版 vLLM を用いて大規模言語モデル（Qwen 3.8 27B, Gemma 4 26B 等）を Tensor Parallelism (TP=2) で高速・安全に推論するためのセットアップおよびパッチ集です。
 
-## 🎯 主な特徴
+---
 
-- **Dual GPU Tensor Parallelism (TP=2)**: 2基の RX 9060 XT (16GB × 2) にモデルウェイトを分散配置。
-- **GGUF 混合量子化対応**: `vllm_gguf_plugin` による GGUF ロードと Triton カーネル最適化。
-- **gfx1200 互換パッチ**: ROCm 7.x / Navi 環境での Triton カーネルおよびモデルローダーの非互換を解決。
+## 🎯 アーキテクチャと改善ハイライト
+
+- **ビルド時パッチ統合（Production-grade）**:
+  - 従来コンテナ起動時に行っていた `site-packages` の直接書き換えを廃止。
+  - `vllm_rocm/Dockerfile` のビルド時に全7パッチを自動適用＆厳格にアサート検証し、`rocm-vllm:custom-gfx1200` イメージとして固定化。
+- **最小権限セキュリティ（No `--privileged`）**:
+  - ホスト権限を丸ごと与える `--privileged` や不要な `sudo` グループを撤廃。
+  - `--device=/dev/kfd --device=/dev/dri --group-add video --group-add render` の最小限のデバイスアクセスで動作。
+- **Navi (gfx1200) 最適化設定**:
+  - **`--ipc=host` 維持**: TP=2 でのマルチGPU間 PyTorch 共有メモリ（Shared Memory）通信の枯渇・ハングを防止。
+  - **`--enforce-eager` 維持**: gfx1200 において不安定な HIP Graph キャプチャを回避し、Triton カスタムカーネルを安定稼働。
+- **モデル実体パスの抽象化**:
+  - Ollama の sha256 blob 直打ちを廃止し、`models/<model-name>/model.gguf` による一貫したパス管理を採用。
 
 ---
 
 ## 🛠️ パッチ構成 (`vllm_rocm/patch_transformers.py`)
 
-1. **Patch 1〜5**: モデルローダー、トークナイザー、KVキャッシュ初期化の安定化。
-2. **Patch 6**:
-   - `qweight_type` の型自動判定・補正（ブロック整合性の担保）。
-   - Triton MMQ カーネル不整合時の DEQUANT フォールバック。
-3. **Patch 7**:
-   - **Gemma 4 テキスト専用 GGUF 対応**: `gemma4_mm.py` の `vision_config=None` アクセス例外を回避するガード処理。
+| パッチ | 対象モジュール | 解決する問題・機能 |
+|---|---|---|
+| **Patch 1** | `transformers.modeling_gguf_pytorch_utils` | `qwen35` アーキテクチャの GGUF ローダー登録 |
+| **Patch 2** | `vllm_gguf_plugin.weights_adapter.default` | `qwen35` のモデル判定、マルチモーダル誤認防止、`ssm_dt.bias` マッピング |
+| **Patch 3** | `vllm_gguf_plugin.quantization.params` | `loaded_shard_id` を受け取る GGUF シャードローダー対応 |
+| **Patch 4** | `vllm.model_executor.models.qwen3_5` | `VocabParallelEmbedding` への `quant_config` とプレフィックス伝播 |
+| **Patch 5** | `vllm.model_executor.layers.mamba.mamba_mixer2` | 重みテンソルの形状不一致時における自動 `view_as` 適合 |
+| **Patch 6** | `vllm_gguf_plugin.quantization.linear` | `qweight_type` の自動判定・補正、ブロック非整合時の Triton DEQUANT 安全フォールバック |
+| **Patch 7** | `vllm.model_executor.models.gemma4_mm` | Gemma 4 テキスト専用 GGUF における `vision_config=None` 例外ガード |
 
 ---
 
-## 🚀 起動スクリプト (`scripts/`)
+## 🚀 運用スクリプト (`scripts/`)
 
-SurrealDB（ポート 8000）等の他サービスと競合しないよう、vLLM は **ポート 8001** でリッスンします。
-
-### 1. Qwen 3.8 27B の起動
+### 1. モデルの切り替え（推奨）
+32GB VRAM 環境のため、Qwen 3.8 (27B) と Gemma 4 (26B) は排他起動（1モデルずつ）となります。
 ```bash
+# Qwen 3.8 27B の起動 (Port 8001)
+bash scripts/switch_model.sh qwen
+
+# Gemma 4 26B の起動 (Port 8001)
+bash scripts/switch_model.sh gemma
+
+# 状態確認・ヘルスチェック
+bash scripts/switch_model.sh status
+
+# 停止
+bash scripts/switch_model.sh stop
+```
+
+### 2. 個別起動
+```bash
+# Qwen 3.8 27B
 bash scripts/run_vllm_qwen.sh
-```
 
-### 2. Gemma 4 26B の起動
-```bash
+# Gemma 4 26B
 bash scripts/run_vllm_gemma.sh
-```
 
-### 3. サーバーの停止
-```bash
+# 停止
 bash scripts/stop_vllm.sh
 ```
 
 ---
 
-## 📁 ディレクトリ構成
+## 📦 Docker イメージの再ビルド
 
-- `models/`: HuggingFace 形式のアーキテクチャ設定（`config.json`）およびチャットテンプレート（`template_qwen.jinja`）。大容量モデル実体は `.gitignore` で除外。
-- `scripts/`: vLLM サーバースクリプト群。
-- `vllm_rocm/`: カスタム Dockerfile および `patch_transformers.py`。
-- `anything-llm/`: Anything-LLM 連携用の Docker Compose 設定。
+環境更新やパッチの再検証を行いたい場合：
+```bash
+cd vllm_rocm
+docker build -t rocm-vllm:custom -t rocm-vllm:custom-gfx1200 .
+```
 
 ---
 
