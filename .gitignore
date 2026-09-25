@@ -1,0 +1,33 @@
+# Model weights (large files)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+models/**/*.gguf
+
+# Backups and temporary files
+*.bak
+*.tmp
+*.log
+__pycache__/
+*.pyc
+
+# Local binaries and build artifacts
+bin/
+*.o
+*.so
+
+# Anything-LLM local storage / user data
+anything-llm/storage/
+anything-llm/server/storage/
+
+# Environment files
+.env
+.env.local
+
+# OS / Editor files
+.DS_Store
+.vscode/
+.idea/
