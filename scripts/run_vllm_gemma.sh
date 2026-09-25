@@ -25,6 +25,7 @@ docker run -d \
   -e GLOO_SOCKET_IFNAME=lo \
   -e HIP_VISIBLE_DEVICES=0,1 \
   -e NCCL_P2P_DISABLE=1 \
+  -e NCCL_PROTO=Simple \
   -e VLLM_ROCM_USE_AITER=0 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --restart unless-stopped \
