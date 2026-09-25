@@ -8,7 +8,7 @@ AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / Navi）環境にお�
 
 - **ビルド時パッチ統合（Production-grade）**:
   - 従来コンテナ起動時に行っていた `site-packages` の直接書き換えを廃止。
-  - `vllm_rocm/Dockerfile` のビルド時に全9パッチを自動適用＆厳格にアサート検証し、`rocm-vllm:custom-gfx1200` イメージとして固定化。
+  - `vllm_rocm/Dockerfile` のビルド時に全10パッチを自動適用＆厳格にアサート検証し、`rocm-vllm:custom-gfx1200` イメージとして固定化。
 - **最小権限セキュリティ（No `--privileged`）**:
   - ホスト権限を丸ごと与える `--privileged` や不要な `sudo` グループを撤廃。
   - `--device=/dev/kfd --device=/dev/dri --group-add video --group-add "$RENDER_GID"` の最小限のデバイスアクセスで動作（ホストの `render` グループ GID をスクリプト側で自動解決）。
@@ -36,7 +36,8 @@ AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / Navi）環境にお�
 | **Patch 6** | `vllm_gguf_plugin.quantization.linear` | `qweight_type` の自動判定・補正、ブロック非整合時の Triton DEQUANT 安全フォールバック |
 | **Patch 7** | `vllm.model_executor.models.gemma4_mm` | Gemma 4 テキスト専用 GGUF における `vision_config=None` ガード（`get_mm_max_tokens_per_item` および `vision_tower` 初期化） |
 | **Patch 8** | `vllm_gguf_plugin.weights_adapter.default` | Gemma 4 重み読み込み時の `model.language_model.` プレフィックス除去および `router.scale` / `router.per_expert_scale` のマッピング |
-| **Patch 9** | `vllm.model_executor.models.gemma4` | Gemma 4 の不均一 `head_dim` (sliding: 256 / full: 512) を `per_layer_config` から適切に取得・設定 |
+| **Patch 9** | `vllm.model_executor.models.gemma4` | Gemma 4 の不均一 `head_dim` (sliding: 256 / full: 512) 解決、`k_eq_v` フルアテンション時の KV ヘッド数整合および動的 QKV split ガード |
+| **Patch 10** | `vllm.model_executor.models.gemma4` & `vllm_gguf_plugin` | Gemma 4 MoE エキスパート重みの GGUF 名解決、`_gguf_moe_weight_type_loader` デフォルト引数対応、および `_qweight` フォールバック |
 
 ---
 
