@@ -352,26 +352,42 @@ def apply_patch_8_gemma4_tensor_name_map():
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.scale"] = (
                     f"model.language_model.layers.{idx}.router.per_expert_scale"
                 )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_up_exps.weight"] = (
+                    f"model.language_model.layers.{idx}.experts.gate_up_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"model.language_model.layers.{idx}.experts.down_proj.weight"
+                )
                 sideload_params.extend([
                     regex.compile(f"model\\\\.language_model\\\\.layers\\\\.{idx}\\\\.router\\\\.(scale|per_expert_scale)"),
                     regex.compile(f"model\\\\.layers\\\\.{idx}\\\\.router\\\\.(scale|per_expert_scale)"),
                 ])
         if model_type == "minimax_m2":'''
 
-    if target_pos in d_code and 'model_type in ("gemma4", "gemma-4"):' not in d_code:
-        d_code = d_code.replace(target_pos, gemma4_block)
-        print("[Patch 8-2] Added Gemma4 router.scale mapping and sideload_params")
+    if target_pos in d_code and 'ffn_gate_up_exps.weight' not in d_code:
+        if 'model_type in ("gemma4", "gemma-4"):' in d_code:
+            # Replace existing gemma4 block if already present from previous run
+            import re
+            d_code = re.sub(
+                r'if model_type in \("gemma4", "gemma-4"\):.*?(?=if model_type == "minimax_m2":)',
+                gemma4_block + '\n        ',
+                d_code,
+                flags=re.DOTALL
+            )
+        else:
+            d_code = d_code.replace(target_pos, gemma4_block)
+        print("[Patch 8-2] Added Gemma4 router.scale and MoE weights mapping")
 
     with open(d_file, "w") as f:
         f.write(d_code)
 
     assert 'if hf_name.startswith("model.language_model."):' in open(d_file).read(), "Patch 8-1 verification failed"
-    assert 'model_type in ("gemma4", "gemma-4"):' in open(d_file).read(), "Patch 8-2 verification failed"
+    assert 'ffn_gate_up_exps.weight' in open(d_file).read(), "Patch 8-2 verification failed"
     print("[Patch 8] Verified successfully")
 
 
 def apply_patch_9_gemma4_heterogeneous_head_dim():
-    """Patch 9: Support per-layer heterogeneous head_dim for Gemma4 full attention layers."""
+    """Patch 9: Support per-layer heterogeneous head_dim and k_eq_v KV head sizing for Gemma4."""
     _gemma4_spec = importlib.util.find_spec("vllm.model_executor.models.gemma4")
     if not _gemma4_spec or not _gemma4_spec.origin:
         print("[Patch 9] gemma4 module not found, skipping")
@@ -380,6 +396,7 @@ def apply_patch_9_gemma4_heterogeneous_head_dim():
     _gemma4_file = pathlib.Path(_gemma4_spec.origin)
     _code = _gemma4_file.read_text()
 
+    # 1. Heterogeneous head_dim resolution
     old_snippet = """        # Gemma4 uses different head dimensions for sliding vs full attention
         layer_type = config.layer_types[layer_idx]
         self.is_full_attention = layer_type == "full_attention"
@@ -400,15 +417,166 @@ def apply_patch_9_gemma4_heterogeneous_head_dim():
 
     if old_snippet in _code:
         _code = _code.replace(old_snippet, new_snippet)
-        _gemma4_file.write_text(_code)
-        print("[Patch 9] Applied Gemma4 heterogeneous head_dim resolution")
-    elif 'hasattr(config, "per_layer_config")' in _code:
-        print("[Patch 9] Already present")
-    else:
-        raise RuntimeError("Patch 9 target pattern not found in gemma4.py")
+        print("[Patch 9-1] Applied Gemma4 heterogeneous head_dim resolution")
 
+    # 2. k_eq_v full-attention num_kv_heads sizing (each TP rank has 2 KV heads)
+    old_kv = """        # For k_eq_v full-attention layers, use num_global_key_value_heads
+        # as the KV head count when k_eq_v is enabled.
+        if use_k_eq_v:
+            num_kv_heads = getattr(
+                config, "num_global_key_value_heads", config.num_key_value_heads
+            )
+        else:
+            num_kv_heads = config.num_key_value_heads"""
+
+    new_kv = """        # For k_eq_v full-attention layers, checkpoint provides 2 KV heads per rank
+        # after GGUF replication under TP. Set total_num_kv_heads = 2 * tp_size so
+        # that per-rank num_kv_heads = 2 and kv_size = 2 * head_dim.
+        if use_k_eq_v:
+            _tp = get_tensor_model_parallel_world_size()
+            num_kv_heads = 2 * _tp
+        else:
+            num_kv_heads = config.num_key_value_heads"""
+
+    if old_kv in _code:
+        _code = _code.replace(old_kv, new_kv)
+        print("[Patch 9-2] Applied Gemma4 k_eq_v KV heads sizing")
+
+    # 3. Dynamic split guard in Gemma4Attention.forward
+    old_split = """        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # Q norm (always applied)
+        q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        q = self.q_norm(q)
+        q = q.flatten(-2, -1)
+
+        if not self.is_kv_shared_layer:
+            # Non-shared: apply K norm + RoPE, V norm
+            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            k = self.k_norm(k)
+            k = k.flatten(-2, -1)
+            q, k = self.rotary_emb(positions, q, k)
+
+            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))"""
+
+    new_split = """        qkv, _ = self.qkv_proj(hidden_states)
+        qkv_dim = qkv.shape[-1]
+        if self.q_size + 2 * self.kv_size != qkv_dim:
+            actual_kv_size = (qkv_dim - self.q_size) // 2
+            actual_num_kv_heads = actual_kv_size // self.head_dim
+            q, k, v = qkv.split([self.q_size, actual_kv_size, actual_kv_size], dim=-1)
+        else:
+            actual_num_kv_heads = self.num_kv_heads
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # Q norm (always applied)
+        q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        q = self.q_norm(q)
+        q = q.flatten(-2, -1)
+
+        if not self.is_kv_shared_layer:
+            # Non-shared: apply K norm + RoPE, V norm
+            k = k.unflatten(-1, (actual_num_kv_heads, self.head_dim))
+            k = self.k_norm(k)
+            k = k.flatten(-2, -1)
+            q, k = self.rotary_emb(positions, q, k)
+
+            v = v.unflatten(-1, (actual_num_kv_heads, self.head_dim))"""
+
+    if old_split in _code:
+        _code = _code.replace(old_split, new_split)
+        print("[Patch 9-3] Applied dynamic qkv split guard in Gemma4Attention.forward")
+
+    _gemma4_file.write_text(_code)
     assert 'hasattr(config, "per_layer_config")' in _gemma4_file.read_text(), "Patch 9 verification failed"
     print("[Patch 9] Verified successfully")
+
+
+def apply_patch_10_gemma4_moe_qweight_routing():
+    """Patch 10: Route Gemma4 MoE qweight and qweight_type properly to MoERunner routed_experts."""
+    _gemma4_spec = importlib.util.find_spec("vllm.model_executor.models.gemma4")
+    if not _gemma4_spec or not _gemma4_spec.origin:
+        print("[Patch 10] gemma4 module not found, skipping")
+        return
+
+    _gemma4_file = pathlib.Path(_gemma4_spec.origin)
+    _code = _gemma4_file.read_text()
+
+    # 1. Route qweight_type in _weight_iterator
+    old_iter = """                if "moe.gate_up_proj" in name and weight.dim() == 3:"""
+    new_iter = """                if "moe.gate_up_proj.qweight_type" in name:
+                    yield name.replace("moe.gate_up_proj.qweight_type", "moe.experts.routed_experts.w13_qweight_type"), weight
+                    continue
+                if "moe.down_proj.qweight_type" in name:
+                    yield name.replace("moe.down_proj.qweight_type", "moe.experts.routed_experts.w2_qweight_type"), weight
+                    continue
+                if "moe.gate_up_proj" in name and weight.dim() == 3:"""
+
+    if old_iter in _code:
+        _code = _code.replace(old_iter, new_iter)
+        print("[Patch 10-1] Added qweight_type routing in Gemma4 _weight_iterator")
+
+    # 2. Add fallback for bare weights matching _qweight in load_weights
+    old_load = """                    elif name.endswith(weight_name_base):
+                        # Bare weight (no suffix)
+                        moe_name = name.replace(
+                            weight_name_base, param_name.rstrip("_") + "_weight"
+                        )"""
+    new_load = """                    elif name.endswith(weight_name_base):
+                        # Bare weight (no suffix)
+                        moe_name = name.replace(
+                            weight_name_base, param_name.rstrip("_") + "_weight"
+                        )
+                        if moe_name not in params_dict:
+                            moe_name_q = name.replace(
+                                weight_name_base, param_name.rstrip("_") + "_qweight"
+                            )
+                            if moe_name_q in params_dict:
+                                moe_name = moe_name_q"""
+
+    if old_load in _code:
+        _code = _code.replace(old_load, new_load)
+        print("[Patch 10-2] Added _qweight fallback in Gemma4 load_weights")
+
+    _gemma4_file.write_text(_code)
+    assert "moe.experts.routed_experts.w13_qweight_type" in _gemma4_file.read_text(), "Patch 10-1 verification failed"
+    assert "moe_name_q = name.replace" in _gemma4_file.read_text(), "Patch 10-2 verification failed"
+
+    # 3. Patch _gguf_moe_weight_type_loader in params.py to provide default arguments
+    import vllm_gguf_plugin.quantization.params as p
+    p_file = inspect.getfile(p)
+    with open(p_file, "r") as f:
+        p_code = f.read()
+
+    old_type_loader = """def _gguf_moe_weight_type_loader(
+    param: Parameter | UninitializedParameter,
+    loaded_weight: torch.Tensor,
+    weight_name: str,
+    shard_id: str,
+    expert_id: int,
+    return_success: bool = False,
+) -> bool | None:"""
+
+    new_type_loader = """def _gguf_moe_weight_type_loader(
+    param: Parameter | UninitializedParameter,
+    loaded_weight: torch.Tensor,
+    weight_name: str = "",
+    shard_id: str | None = None,
+    expert_id: int = 0,
+    return_success: bool = False,
+) -> bool | None:"""
+
+    if old_type_loader in p_code:
+        p_code = p_code.replace(old_type_loader, new_type_loader)
+        with open(p_file, "w") as f:
+            f.write(p_code)
+        print("[Patch 10-3] Patched _gguf_moe_weight_type_loader default arguments in params.py")
+    else:
+        print("[Patch 10-3] Already present or compatible")
+
+    assert "weight_name: str = \"\"" in open(p_file).read(), "Patch 10-3 verification failed"
+    print("[Patch 10] Verified successfully")
 
 
 def main():
@@ -423,6 +591,7 @@ def main():
         ("Patch 7: Gemma4 text-only GGUF guard", apply_patch_7_gemma4_mm_guard),
         ("Patch 8: Gemma4 model.language_model prefix strip", apply_patch_8_gemma4_tensor_name_map),
         ("Patch 9: Gemma4 heterogeneous head_dim resolution", apply_patch_9_gemma4_heterogeneous_head_dim),
+        ("Patch 10: Gemma4 MoE qweight routing", apply_patch_10_gemma4_moe_qweight_routing),
     ]
 
     for name, patch_fn in patches:
@@ -432,7 +601,7 @@ def main():
             print(f"❌ ERROR applying {name}: {e}", file=sys.stderr)
             sys.exit(1)
 
-    print("\n✅ All 9 ROCm vLLM patches applied and verified successfully!\n")
+    print("\n✅ All 10 ROCm vLLM patches applied and verified successfully!\n")
 
 if __name__ == "__main__":
     main()
