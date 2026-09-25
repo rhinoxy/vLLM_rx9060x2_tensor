@@ -1,0 +1,6 @@
+#!/bin/bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="/home/your_name/gAI-LLM/bin:$PATH"
+
+echo "Stopping AnythingLLM..."
+cd "$DIR" && docker-compose down

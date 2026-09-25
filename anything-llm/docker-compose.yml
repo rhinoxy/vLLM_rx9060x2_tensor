@@ -1,0 +1,14 @@
+services:
+  anythingllm:
+    image: mintplexlabs/anythingllm:latest
+    container_name: anythingllm
+    network_mode: host
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - ./storage:/app/server/storage
+      - ./storage/.env:/app/server/.env
+    environment:
+      - STORAGE_DIR=/app/server/storage
+      - SERVER_PORT=3001
+    restart: unless-stopped
