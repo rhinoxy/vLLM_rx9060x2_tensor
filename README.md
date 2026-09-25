@@ -12,9 +12,12 @@ AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / Navi）環境にお�
 - **最小権限セキュリティ（No `--privileged`）**:
   - ホスト権限を丸ごと与える `--privileged` や不要な `sudo` グループを撤廃。
   - `--device=/dev/kfd --device=/dev/dri --group-add video --group-add "$RENDER_GID"` の最小限のデバイスアクセスで動作（ホストの `render` グループ GID をスクリプト側で自動解決）。
-- **Navi (gfx1200) 最適化設定**:
+- **Navi (gfx1200 / RDNA4) 最適化・デッドロック防止設定**:
   - **`--ipc=host` 維持**: TP=2 でのマルチGPU間 PyTorch 共有メモリ（Shared Memory）通信の枯渇・ハングを防止。
-  - **`--enforce-eager` 維持**: gfx1200 において不安定な HIP Graph キャプチャを回避し、Triton カスタムカーネルを安定稼働。
+  - **`--enforce-eager` 維持**: gfx1200 において不安定な HIP Graph キャプチャ（0%ハング）を回避し、Triton カスタムカーネルを安定稼働。
+  - **`HIP_VISIBLE_DEVICES=0,1`**: ホスト側の内蔵 iGPU 誤認識による RCCL デッドロックを防止。
+  - **`NCCL_P2P_DISABLE=1`**: PCIe 接続（XGMI 非搭載）環境下での P2P DMA 通信不整合によるマルチGPUハングを回避。
+  - **`VLLM_ROCM_USE_AITER=0`**: RDNA4 未対応の AITer 最適化パスを明示的にバイパス。
 - **モデル実体パスの抽象化**:
   - Ollama の sha256 blob 直打ちを廃止し、`models/<model-name>/model.gguf` による一貫したパス管理を採用。
 
