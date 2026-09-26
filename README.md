@@ -1,6 +1,7 @@
 # Dual RX 9060 XT vLLM ROCm Setup (`vLLM_rx9060x2_tensor`)
 
 AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / RDNA4）環境において、ROCm版 vLLM を用いて大規模言語モデル（Qwen 3.8 27B, Gemma 4 26B 等）を Tensor Parallelism (TP=2) で高速・安全に推論するためのセットアップ、最適化パッチ集、および試行錯誤の全記録です。
+この文章を含め、AI生成です。
 
 ---
 
