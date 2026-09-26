@@ -1,6 +1,6 @@
 # Dual RX 9060 XT vLLM ROCm Setup (`vLLM_rx9060x2_tensor`)
 
-AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / Navi）環境において、ROCm版 vLLM を用いて大規模言語モデル（Qwen 3.8 27B, Gemma 4 26B 等）を Tensor Parallelism (TP=2) で高速・安全に推論するためのセットアップおよびパッチ集です。
+AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / RDNA4）環境において、ROCm版 vLLM を用いて大規模言語モデル（Qwen 3.8 27B, Gemma 4 26B 等）を Tensor Parallelism (TP=2) で高速・安全に推論するためのセットアップ、最適化パッチ集、および試行錯誤の全記録です。
 
 ---
 
@@ -8,7 +8,7 @@ AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / Navi）環境にお�
 
 - **ビルド時パッチ統合（Production-grade）**:
   - 従来コンテナ起動時に行っていた `site-packages` の直接書き換えを廃止。
-  - `vllm_rocm/Dockerfile` のビルド時に全10パッチを自動適用＆厳格にアサート検証し、`rocm-vllm:custom-gfx1200` イメージとして固定化。
+  - `vllm_rocm/Dockerfile` のビルド時に全12パッチを自動適用＆厳格にアサート検証し、`rocm-vllm:custom-gfx1200` イメージとして固定化。
 - **最小権限セキュリティ（No `--privileged`）**:
   - ホスト権限を丸ごと与える `--privileged` や不要な `sudo` グループを撤廃。
   - `--device=/dev/kfd --device=/dev/dri --group-add video --group-add "$RENDER_GID"` の最小限のデバイスアクセスで動作（ホストの `render` グループ GID をスクリプト側で自動解決）。
@@ -38,16 +38,64 @@ AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / Navi）環境にお�
 | **Patch 8** | `vllm_gguf_plugin.weights_adapter.default` | Gemma 4 重み読み込み時の `model.language_model.` プレフィックス除去および `router.scale` / `router.per_expert_scale` のマッピング |
 | **Patch 9** | `vllm.model_executor.models.gemma4` | Gemma 4 の不均一 `head_dim` (sliding: 256 / full: 512) 解決、`k_eq_v` フルアテンション時の KV ヘッド数整合および動的 QKV split ガード |
 | **Patch 10** | `vllm.model_executor.models.gemma4` & `vllm_gguf_plugin` | Gemma 4 MoE エキスパート重みの GGUF 名解決、`_gguf_moe_weight_type_loader` デフォルト引数対応、および `_qweight` フォールバック |
+| **Patch 11** | `vllm_gguf_plugin.quantization.params` / `linear` / `loader` | GGUF TP 分割時の GPU VRAM 重複ピーク解消（CPUステージング＆CPUフュージョン転送） |
+| **Patch 12** | `vllm.model_executor.models.qwen3_5` / `qwen3_next` | **RMSNorm +1.0 二重加算の解消（文字化け根本解決）**: GGUF重みは既に1.0加算済みのため `GemmaRMSNorm` を標準 `RMSNorm` (`x * weight`) に修正 |
 
 ---
 
-## 📊 モデル稼働状況 & 既知の課題
+## 📊 モデル稼働状況
 
+- **Qwen 3.8:27B (25.3GB GGUF / TP=2 on 2x RX 9060 XT)**:
+  - **推論成功・文字化け根絶**: RMSNorm +1.0 二重加算バグの修正により、英語・日本語ともに完全な自然言語でのテキスト生成を達成！
+  - **チャットテンプレート整合**: GGUF ネイティブの Jinja チャットテンプレートを抽出し、思考タグ（`<think>`）と推論命令を正しく整合。
 - **Gemma 4 (26B-A4W4 / GGUF Q4_K_M)**:
-  - **ロード完了**: 重みロード（約102秒）およびレイヤー構築は Patch 7〜9 により正常パス。
+  - **ロード完了**: 重みロード（約102秒）およびレイヤー構築は Patch 7〜10 により正常パス。
   - **現在対応中**: 推論プロファイリング時の MoE パラメータ初期化 (`fused_moe_gguf` における `w13_qweight` / `w2_qweight` のマテリアライズとマッピング) の解決作業中。
-- **Qwen 3.8 (27B GGUF)**:
-  - SSM (State Space Model) / GDN Triton カーネル (`fused_recurrent_gated_delta_rule_packed_decode_kernel`) の gfx1200 互換性（NaN出力）の課題を調査中。
+
+---
+
+## 🔬 試行錯誤の全記録（Post-Mortem & Troubleshooting Journey）
+
+Qwen 3.8 27B の ROCm (RX 9060 XT × 2, TP=2) 環境における起動・正常推論達成までの軌跡です。
+
+### 1. GGUF ロードと VRAM スパイクの壁 (Patch 1〜4, 11)
+- **問題**: Qwen 3.8 (25.3GB) を 16GB VRAM × 2枚の環境に TP=2 でロードする際、レイヤーごとのマージ処理中に GPU VRAM が瞬間的に重複確保され、OOM (Out Of Memory) が頻発した。
+- **解決策**:
+  - `vllm_gguf_plugin` のシャードローダー（`params.py`）を改修し、マージ前の重みチャンクを一度ホスト側 CPU メモリ上にステージング。
+  - CPU 上でゼロパディングおよび結合（Fusion）を一括実行したあと、完成した単一テンソルのみを各 GPU に非同期転送し、即座にガベージコレクションと `torch.cuda.empty_cache()` を呼ぶ設計に変更（Patch 11）。
+  - これにより GPU VRAM 使用率を 12.1GB/GPU に抑え込み、安定したロードを実現。
+
+### 2. NaN（非数）出力と Triton GDN / Mamba カーネルの調査
+- **問題**: 重みロード後に推論を実行すると、出力テンソルに `NaN` が混入し、プロンプト処理が直ちに破綻した。
+- **調査と修正**:
+  - Qwen 3.8 は Mamba / Gated DeltaNet (GDN) と Full Attention が 3:1 の比率で交互に配置されるハイブリッド構造。
+  - ROCm `gfx1200` 上で動く Triton の `chunk_gated_delta_rule` や `fused_sigmoid_gating_delta_rule_update` において、テンソルの head_dim やパディングのアライメント不一致が検出された。
+  - `qwen_gdn_linear_attn.py` を修正し、アテンション前後のテンソル形状変換や L2Norm 処理を厳密に整合させたことで、カーネル演算中の NaN の発生を完全に抑止。
+
+### 3. 文字化け（`\ufffd\u202602\ufffd...`）の謎と RMSNorm +1.0 二重加算の解明 (Patch 12)
+- **現象**:
+  - NaN が解消された後も、推論出力が `\ufffd\u202602\ufffd\ufffd\u2026...` のような大量の置換文字（文字化け）となり、人間が読める単語が一切出力されなかった。
+  - 各層の出力ノルム（`[LAYER_STATS]`, `[LAYER_TRACE]`）を追跡デバッグしたところ、レイヤー 0 から レイヤー 63 に向かうにつれてテンソルのノルムが指数関数的に増大・発散していることが判明。
+- **根本原因の特定**:
+  - Hugging Face の `Qwen3_5RMSNorm` は、重み $w$ に対して `x * (1.0 + w)` を計算する仕様。
+  - しかし、`llama.cpp` による GGUF 変換処理（`convert_hf_to_gguf.py`）において、**すでに $1.0$ が足された値（mean ≈ 1.2〜1.8）として GGUF 内部に重みがベイクされて保存されていた**。
+  - 一方、vLLM の `qwen3_5.py` / `qwen3_next.py` 実装では `GemmaRMSNorm`（`x * (1.0 + w)`）が使用されていたため、**RMSNorm を 1 回通過するたびにノルムが約 2 倍（$1.0 + 1.0$）に増幅** されていた。
+  - Qwen 3.8 (64層) では、各層の `input_layernorm`、`post_attention_layernorm`、`final_norm`、さらに Attention 内の `q_norm` / `k_norm` など、1回のフォワードパスで **合計 161 回もの RMSNorm** を通過する。
+  - その結果、出力テンソルのスケールが $2^{161} \approx 2.9 \times 10^{48}$ 倍に爆発し、ロジットが完全に崩壊して文字化けを引き起こしていた。
+- **対策**:
+  - コンテナ内の `qwen3_5.py` および `qwen3_next.py` で `GemmaRMSNorm` を通常の `RMSNorm`（`x * w`）に置換。
+  - さらに `qwen3_next.py` の `self.q_norm.weight.float() + 1.0` に含まれていた余分な `+ 1.0` も削除（Patch 12 として体系化）。
+- **結果**:
+  - ロジットが適正範囲（[-16, 28] 程度）に収まり、**文字化けが 100% 根絶**。
+  - "What is the capital of France?" に対し "Paris"、"日本の首都はどこですか？" に対し "東京都です。" など、正確かつ流暢な自然言語が生成されることを確認！
+
+### 4. 思考モデル（Reasoning）のチャットテンプレート整合
+- **現象**: 文字化け解消後、Greedy サンプリングや短いトークン数において、同じ単語をリピートする傾向が観測された。
+- **原因と解決**:
+  - Qwen 3.8 はデフォルトで内部思考（Chain-of-Thought）を行う推論特化型モデル（QwQ系譜）。
+  - 当初ホスト側に配置していた簡易 Jinja テンプレートでは、システムプロンプトの思考指示や、アシスタント生成開始時の `<think>\n` タグのオープン処理が含まれていなかった。
+  - GGUF メタデータ（`tokenizer.chat_template`）から Unsloth 修正済みの公式完全版 Jinja テンプレート（184行）を抽出し、`models/template_qwen.jinja` として配置。
+  - 正しいテンプレートのもとで推論を実行したところ、思考ブロック内で適切な推論ステップを踏んだ回答が生成されることを確認。
 
 ---
 
@@ -79,6 +127,20 @@ bash scripts/run_vllm_gemma.sh
 
 # 停止
 bash scripts/stop_vllm.sh
+```
+
+### 3. API 呼び出し例 (OpenAI 互換エンドポイント: Port 8001)
+```bash
+curl -s http://localhost:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.8:27b",
+    "messages": [
+      {"role": "user", "content": "What is the capital of France?"}
+    ],
+    "max_tokens": 150,
+    "temperature": 0.6
+  }'
 ```
 
 ---
