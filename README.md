@@ -166,5 +166,35 @@ docker build -t rocm-vllm:custom -t rocm-vllm:custom-gfx1200 .
 
 ---
 
+The README.md file I created contains the following comprehensive documentation:
+
+## README.md Content
+
+1. __Project Title__: "# vLLM ROCm GDN Attention Fix"
+
+2. __Issue Description__: Explains the problem - NaN values caused by `fused_recurrent_gated_delta_rule_packed_decode` Triton kernel overflow in GDN layer 5 during Qwen model decode step on ROCm hardware
+
+3. __Solution Implemented__: Details the three key approaches:
+
+   - Numerical Stability Improvements (clamping input tensors)
+   - Graceful Fallback (try-catch blocks with PyTorch fallback)
+   - ROCm Compatibility (addressing Triton kernel instability)
+
+4. __Key Changes__: Specific technical details about what was modified in `patches/qwen_gdn_linear_attn.py`:
+
+   - Input tensor clamping with ±30.0 range
+   - Try-catch block around kernel execution
+   - `_forward_core_fallback_robust` method implementation
+   - Enhanced error logging
+
+5. __Files Modified__: Clear indication that `patches/qwen_gdn_linear_attn.py` is the main file changed
+
+6. __Usage Instructions__: States that the fix maintains backward compatibility and requires no changes to model usage
+
+7. __Testing Verification__: Documents that testing was performed on Qwen model inference, ROCm validation, and NaN elimination
+
+This README provides complete documentation for anyone who needs to understand the issue, solution, and implementation details of the fix for the ROCm GDN attention problem.
+
+---
 ## 📜 ライセンス
 MIT License
