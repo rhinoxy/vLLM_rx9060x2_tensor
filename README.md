@@ -98,6 +98,16 @@ Qwen 3.8 27B の ROCm (RX 9060 XT × 2, TP=2) 環境における起動・正常�
   - GGUF メタデータ（`tokenizer.chat_template`）から Unsloth 修正済みの公式完全版 Jinja テンプレート（184行）を抽出し、`models/template_qwen.jinja` として配置。
   - 正しいテンプレートのもとで推論を実行したところ、思考ブロック内で適切な推論ステップを踏んだ回答が生成されることを確認。
 
+### 5. デコードステップにおける GDN（Gated Delta Net）の NaN 調査状況
+- **現象**:
+  - `curl -s http://localhost:8001/v1/chat/completions ... max_tokens: 150` でリクエストを送信した際、`"content": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!..."`（感嘆符 `!` が連続出力）される事象を確認。
+- **原因の追跡**:
+  - **Prefill（プロンプト処理）段階**: 正常終了。Layer 0〜63 まで正常に計算され、初回復帰トークンの Logits も正常値（Top1: `\n`）を出力。
+  - **Decode（生成ステップ）段階**: 最初のトークン生成時、**Layer 5 の `linear_attention` (GDN)** 内部で `core_attn_out` に `NaN` が発生。
+  - 一度 `NaN` が発生すると、以降の全レイヤーおよび後続ステップのロジットがすべて `NaN` で汚染され、サンプリング/argmax で token 0（`!`）が選ばれ続ける状態となる。
+- **今後の対策方針**:
+  - `QwenGatedDeltaNetAttention` のデコードパス（`fused_recurrent_gated_delta_rule_packed_decode` / `fused_sigmoid_gating_delta_rule_update`）における Triton カーネルの数値安定性（FP16/BF16 計算、SSM 状態インデックス、L2Norm）の修正と検証。
+
 ---
 
 ## 🚀 運用スクリプト (`scripts/`)
