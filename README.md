@@ -226,5 +226,64 @@ The README.md file I created contains the following comprehensive documentation:
 This README provides complete documentation for anyone who needs to understand the issue, solution, and implementation details of the fix for the ROCm GDN attention problem.
 
 ---
+
+## ⚡ Strata (Qwen3.8-Flash-Next) オンデマンド起動 & OpenClaw 連携
+
+常時モデルをVRAMにロードしているとGPUの待機電力（1枚あたり約15〜20W以上）が消費されるため、**必要な推論時のみ自動ロードし、アイドル時にVRAMを自動解放するオンデマンド構成**を導入しています。
+
+### 1. 特徴・アーキテクチャ
+- **遅延ロード (`lazy_load: true`)**: サーバー起動時はPythonのHTTPリスナー（メモリ数十MB）のみが待機し、VRAMは0%（GPU電力 ~9W）。
+- **オンデマンド・ロード**: OpenClaw等のクライアントから `/v1/chat/completions` リクエストを受信した瞬間に自動でStrataエンジンが起動しモデルをロード（約60秒）。
+- **アイドル時自動アンロード (`idle_unload_s: 300`)**: リクエスト完了後、指定秒数（デフォルト5分）アクセスが途絶えると自動でC++エンジンを終了し、VRAMを完全解放。
+- **手動アンロード**: `curl -X POST http://127.0.0.1:8081/unload -H "Content-Type: application/json" -d "{}"` で即時解放も可能。
+- **ウォッチドッグ・プリフィル最適化**:
+  - `STRATA_WATCHDOG_S: 300`: 大コンテキスト（2万トークン等）処理時のタイムアウトを防止。
+  - `--prefill 2048`: チャンク分割を最適化し、SSD/PLEの読み込みレイテンシを平滑化。
+
+### 2. OpenClaw 設定 (`~/.openclaw/openclaw.json`)
+```json
+"strata": {
+  "baseUrl": "http://127.0.0.1:8081/v1",
+  "api": "openai-completions",
+  "apiKey": "strata-local",
+  "models": [
+    {
+      "id": "qwen3.8-flash-next-iq3_s",
+      "name": "Qwen 3.8 Flash Next (Strata IQ3_S)",
+      "reasoning": true,
+      "input": ["text"],
+      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+      "contextWindow": 65536,
+      "contextTokens": 65536,
+      "maxTokens": 8192,
+      "compat": {
+        "supportsUsageInStreaming": true,
+        "supportsTools": true,
+        "supportsJsonSchemaResponseFormat": true
+      }
+    }
+  ]
+}
+```
+
+### 3. OpenClaw からの実行例
+```bash
+# ヘッドレス実行
+openclaw agent exec --model strata/qwen3.8-flash-next-iq3_s "質問文"
+```
+
+### 4. 常駐サービス管理 (systemd user)
+```bash
+# 起動・停止・ステータス
+systemctl --user start strata
+systemctl --user stop strata
+systemctl --user status strata
+
+# 自動起動の有効化
+systemctl --user enable strata
+```
+
+---
 ## 📜 ライセンス
 MIT License
+
