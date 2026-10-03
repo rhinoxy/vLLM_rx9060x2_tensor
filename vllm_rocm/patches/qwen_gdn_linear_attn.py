@@ -3,7 +3,6 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 from typing import Literal
-import logging
 
 import torch
 from einops import rearrange
@@ -1170,8 +1169,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # The AITER fused reshape/conv kernel expects Qwen3-Next's interleaved
         # GQA layout. Qwen3.5 uses a non-interleaved q/k/v/z layout and must use
         # the generic path below to split/rearrange inputs correctly.
+        # On ROCm gfx1200, gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule produces NaN
+        # in decode steps. We fall through to prepare_gdn_attention_core_inputs + _forward_core
+        # which uses the robust FP32 PyTorch Gated Delta Rule implementation.
         if (
-            self.gqa_interleaved_layout
+            False
+            and self.gqa_interleaved_layout
             and attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
@@ -1224,8 +1227,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
         if (
-            self.enable_packed_recurrent_decode
-            and attn_metadata.spec_sequence_masks is None
+            attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
         ):
@@ -1632,34 +1634,63 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             validate_data=False,
         )
-        # Add numerical stability for ROCm environment to prevent NaN in Triton kernel
-        try:
-            # Apply numerical clamping before kernel execution to prevent overflow
-            mixed_qkv_non_spec = torch.clamp(mixed_qkv_non_spec, -30.0, 30.0)
-            a = torch.clamp(a, -30.0, 30.0)
-            b = torch.clamp(b, -30.0, 30.0)
-            A_log = torch.clamp(A_log, -30.0, 30.0)
-            
-            fused_recurrent_gated_delta_rule_packed_decode(
-                mixed_qkv=mixed_qkv_non_spec,
-                a=a,
-                b=b,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                scale=self.head_k_dim**-0.5,
-                initial_state=ssm_state,
-                out=out_buf,
-                ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
-                use_qk_l2norm_in_kernel=True,
-            )
-        except (RuntimeError, OverflowError) as e:
-            # If kernel fails due to numerical overflow, fall back to a stable PyTorch implementation
-            logger.warning(f"Kernel failed with overflow error: {e}. Using fallback implementation.")
-            # Use a simplified but numerically stable approach
-            self._forward_core_fallback_robust(
-                mixed_qkv_non_spec, a, b, ssm_state, out_buf, 
-                non_spec_state_indices_tensor[:num_actual_tokens]
-            )
+        # Robust FP32 PyTorch Gated Delta Rule decode (ROCm gfx1200 numerical stability)
+        q_dim = self.key_dim // self.tp_size
+        k_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+        q, k, v = mixed_qkv_non_spec.split([q_dim, k_dim, v_dim], dim=-1)
+
+        H = self.num_k_heads // self.tp_size
+        HV = self.num_v_heads // self.tp_size
+        K = self.head_k_dim
+        V = self.head_v_dim
+
+        q = q.view(num_actual_tokens, H, K)
+        k = k.view(num_actual_tokens, H, K)
+        v = v.view(num_actual_tokens, HV, V)
+
+        if H < HV:
+            q = q.repeat_interleave(HV // H, dim=1)
+            k = k.repeat_interleave(HV // H, dim=1)
+
+        scale = K ** -0.5
+        q = torch.nn.functional.normalize(q.float(), p=2.0, dim=-1, eps=1e-6) * scale
+        k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1, eps=1e-6)
+        v = v.float()
+
+        x = a.float() + self.dt_bias.float()
+        softplus_x = torch.nn.functional.softplus(x)
+        g = -torch.exp(self.A_log.float()) * softplus_x
+        decay = torch.exp(g.clamp(min=-80.0, max=0.0)).unsqueeze(-1).unsqueeze(-1)
+        beta = torch.sigmoid(b.float()).unsqueeze(-1).unsqueeze(-1)
+
+        state_indices = non_spec_state_indices_tensor[:num_actual_tokens]
+        valid_mask = state_indices > 0
+
+        core_attn_out[:num_actual_tokens].zero_()
+
+        if any(x in getattr(self, 'prefix', '') for x in ('layers.0.', 'layers.1.', 'layers.4.')):
+            print(f'[PYTORCH DECODE {self.prefix}] tokens={num_actual_tokens} valid={valid_mask.sum().item()}', flush=True)
+
+        if valid_mask.any():
+            valid_idx = state_indices[valid_mask]
+            h0 = ssm_state[valid_idx].float()
+            h = h0 * decay[valid_mask]
+
+            k_col = k[valid_mask].unsqueeze(-1)
+            hk = torch.matmul(h, k_col)
+
+            v_col = v[valid_mask].unsqueeze(-1)
+            v_diff = beta[valid_mask] * (v_col - hk)
+
+            h = h + torch.matmul(v_diff, k_col.transpose(-1, -2))
+
+            q_col = q[valid_mask].unsqueeze(-1)
+            o = torch.matmul(h, q_col).squeeze(-1)
+
+            core_attn_out[:num_actual_tokens][valid_mask] = o.to(core_attn_out.dtype)
+            ssm_state[valid_idx] = h.to(ssm_state.dtype)
+
         return
 
 
@@ -1793,46 +1824,3 @@ def fused_gdn_gating(
         num_warps=1,
     )
     return g, beta_output
-
-
-def _forward_core_fallback_robust(
-    self,
-    mixed_qkv_non_spec: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    ssm_state: torch.Tensor,
-    out_buf: torch.Tensor,
-    ssm_state_indices: torch.Tensor,
-) -> None:
-    """Robust fallback implementation for GDN attention with numerical stability."""
-    # This fallback uses PyTorch operations instead of Triton kernel
-    # to avoid numerical overflow issues in ROCm environment
-    
-    # Ensure we're working with appropriate dtypes for numerical stability
-    mixed_qkv_non_spec = mixed_qkv_non_spec.float()
-    a = a.float()
-    b = b.float()
-    
-    # Apply numerical clamping to prevent overflow
-    clamp_val = 20.0  # Reduced clamp value for better stability
-    mixed_qkv_non_spec = torch.clamp(mixed_qkv_non_spec, -clamp_val, clamp_val)
-    a = torch.clamp(a, -clamp_val, clamp_val)
-    b = torch.clamp(b, -clamp_val, clamp_val)
-    
-    # Use simple recurrent attention computation without kernel overflow
-    batch_size, seq_len, hidden_dim = mixed_qkv_non_spec.shape
-    
-    # Simple implementation that avoids complex Triton operations
-    for i in range(seq_len):
-        if i == 0:
-            out_buf[i] = mixed_qkv_non_spec[i, 0, :].unsqueeze(0)  # First token
-        else:
-            # Simple attention update with clamped exponential operations
-            # This avoids the problematic kernel overflow while maintaining functionality
-            attention_weight = torch.exp(-torch.abs(b[i-1]))
-            attention_weight = torch.clamp(attention_weight, max=1e20)
-            
-            out_buf[i] = (
-                attention_weight * out_buf[i-1] + 
-                mixed_qkv_non_spec[i, 0, :].unsqueeze(0)
-            )

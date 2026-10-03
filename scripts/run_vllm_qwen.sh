@@ -21,6 +21,9 @@ docker run -d \
   -v /home/your_name/gAI-LLM/models:/models:ro \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/.cache/tvm-ffi:/root/.cache/tvm-ffi \
+  -v /home/your_name/gAI-LLM/vllm_rocm/patches/qwen_gdn_linear_attn.py:/opt/python/lib/python3.14/site-packages/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:ro \
+  -v /home/your_name/gAI-LLM/vllm_rocm/patches/qwen3_next.py:/opt/python/lib/python3.14/site-packages/vllm/model_executor/models/qwen3_next.py:ro \
+  -v /home/your_name/gAI-LLM/vllm_rocm/patches/qwen3_5.py:/opt/python/lib/python3.14/site-packages/vllm/model_executor/models/qwen3_5.py:ro \
   -e GLOO_SOCKET_IFNAME=lo \
   -e HIP_VISIBLE_DEVICES=0,1 \
   -e NCCL_P2P_DISABLE=1 \

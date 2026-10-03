@@ -49,9 +49,13 @@ AMD Radeon RX 9060 XT × 2（合計 32GB VRAM, `gfx1200` / RDNA4）環境にお�
 - **Qwen 3.8:27B (25.3GB GGUF / TP=2 on 2x RX 9060 XT)**:
   - **推論成功・文字化け根絶**: RMSNorm +1.0 二重加算バグの修正により、英語・日本語ともに完全な自然言語でのテキスト生成を達成！
   - **チャットテンプレート整合**: GGUF ネイティブの Jinja チャットテンプレートを抽出し、思考タグ（`<think>`）と推論命令を正しく整合。
+- **Qwen 3.8 Flash Next (IQ3_S / 125B MoE via Strata on 2x RX 9060 XT)**:
+  - **推論成功・NUMA最適化達成**: Strata（HIP backend / Layer-split Pipeline Parallelism）により 125B MoE モデルの安定稼働を達成。
+  - **NUMA インターリーブ効果**: デュアルソケット QPI 跨ぎ構成において `numactl --interleave=all` を適用することで、生成速度が **5.5 tok/s から 7.5 tok/s（約36%向上）** に大幅改善！
 - **Gemma 4 (26B-A4W4 / GGUF Q4_K_M)**:
   - **ロード完了**: 重みロード（約102秒）およびレイヤー構築は Patch 7〜10 により正常パス。
   - **現在対応中**: 推論プロファイリング時の MoE パラメータ初期化 (`fused_moe_gguf` における `w13_qweight` / `w2_qweight` のマテリアライズとマッピング) の解決作業中。
+
 
 ---
 
@@ -108,17 +112,33 @@ Qwen 3.8 27B の ROCm (RX 9060 XT × 2, TP=2) 環境における起動・正常�
 - **今後の対策方針**:
   - `QwenGatedDeltaNetAttention` のデコードパス（`fused_recurrent_gated_delta_rule_packed_decode` / `fused_sigmoid_gating_delta_rule_update`）における Triton カーネルの数値安定性（FP16/BF16 計算、SSM 状態インデックス、L2Norm）の修正と検証。
 
+### 6. Strata による Qwen 3.8 Flash Next のマルチGPU (RX 9060 XT × 2) 推論と NUMA 最適化
+- **背景と課題**:
+  - Qwen 3.8 Flash Next（125B MoE / 512 experts）を 32GB VRAM（RX 9060 XT × 2）+ 188GB ホスト RAM 環境で推論するため、Strata（HIP バックエンド）を導入。
+  - 排熱管理の都合上、GPU 1（Node 0 / ソケット0）と GPU 2（Node 1 / ソケット1）が異なる CPU ソケットに接続されており、GPU 間およびメモリアクセスが **QPI インターコネクト（NUMA Distance 21）** を跨ぐハードウェア構成。
+- **Layer-split (Pipeline Parallelism) による安定稼働**:
+  - Strata は全レイヤーで頻繁な All-Reduce を伴う Tensor Parallelism（Row-split）ではなく、検証ウィンドウ（verify window）ごとに 1 回だけホスト Pinned RAM 経由でトークンを受け渡す **Layer-split（パイプライン並列）** を採用。
+  - これにより、NVLink や XGMI のない民生用 PCIe / QPI 跨ぎ環境でも通信チャッターを最小限に抑え、IQ3_S（約 55GB GGUF）の安定稼働を達成。
+- **NUMA インターリーブ（`numactl --interleave=all`）による劇的改善**:
+  - **ボトルネック**: Linux デフォルトの First-touch 割り当てでは、ホスト側 Expert Arena（約 47GB）が起動ソケット（Node 0）に偏って確保され、Node 1 側の GPU 2 によるリモートアクセスが QPI バス帯域を激しく圧迫していた。
+  - **解決策**: `numactl --interleave=all` を適用し、両ソケット（DDR4 8ch）に物理メモリページを均等にストライピング配置。
+  - **実測結果**: トークン生成速度が **5.5 tok/s → 7.5 tok/s（約 36% 向上）** に大幅上昇！
+- **Speculative Decoding (MTP) の知見**:
+  - 高レイテンシな QPI 経由環境では、MTP（`--spec 4`）の検証ラウンドトリップがボトルネックになりやすいため、`--spec 2`（ドラフト長短縮）や `--spec-min-p 0.6`、あるいは `--spec 0` での検証が極めて有効。
+
 ---
 
 ## 🚀 運用スクリプト (`scripts/`)
 
-### 1. モデルの切り替え（推奨）
-32GB VRAM 環境のため、Qwen 3.8 (27B) と Gemma 4 (26B) は排他起動（1モデルずつ）となります。
+### 1. モデルの切り替え・起動
 ```bash
-# Qwen 3.8 27B の起動 (Port 8001)
+# Strata: Qwen 3.8 Flash Next (125B MoE, IQ3_S) の起動 (Port 8081 / NUMA インターリーブ適用)
+bash scripts/run_strata_qwen.sh
+
+# vLLM: Qwen 3.8 27B の起動 (Port 8001)
 bash scripts/switch_model.sh qwen
 
-# Gemma 4 26B の起動 (Port 8001)
+# vLLM: Gemma 4 26B の起動 (Port 8001)
 bash scripts/switch_model.sh gemma
 
 # 状態確認・ヘルスチェック
@@ -128,7 +148,7 @@ bash scripts/switch_model.sh status
 bash scripts/switch_model.sh stop
 ```
 
-### 2. 個別起動
+### 2. 個別起動 (vLLM)
 ```bash
 # Qwen 3.8 27B
 bash scripts/run_vllm_qwen.sh

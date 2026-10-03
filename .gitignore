@@ -31,3 +31,5 @@ anything-llm/server/storage/
 .DS_Store
 .vscode/
 .idea/
+venv/
+.venv/
